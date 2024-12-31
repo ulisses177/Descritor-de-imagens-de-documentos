@@ -1,0 +1,1 @@
+# Descritor-de-imagens-de-documentos

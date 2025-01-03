@@ -1,17 +1,15 @@
 import os
-import fitz  # PyMuPDF
-import tiktoken
-import re
+import fitz
 import base64
-import csv
+import json
+import logging
+from dataclasses import dataclass
+from typing import List, Dict
 from dotenv import load_dotenv
 from openai import AzureOpenAI
-import logging
 
-# Configurar logging
+# Configuração básica
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Carregar variáveis de ambiente
 load_dotenv()
 
 # Configurar cliente Azure OpenAI
@@ -20,285 +18,263 @@ client = AzureOpenAI(
     api_key=os.getenv("AOAI_API_KEY"),
     api_version="2024-02-15-preview"
 )
-
 deployment_name = os.getenv("AOAI_DEPLOYMENT")
 
-# Definir o prompt template para geração de tutorial
-tutorial_prompt_template = """
-Você é um especialista em sistemas de gestão que cria tutoriais detalhados. Vou fornecer um contexto acumulado de uma funcionalidade em um sistema de gerenciamento e, com base nisso, gostaria que você escrevesse ou atualizasse um tutorial exaustivo passo a passo, semelhante ao exemplo que descreve a aprovação de inconsistências no sistema Exati. O tutorial deve seguir a mesma estrutura, com os seguintes pontos:
-
-    1. Fluxo de navegação no sistema
-    2. Passos detalhados sobre a configuração da nova funcionalidade
-    3. Exemplos de interações visuais ou botões a serem clicados
-    4. Opções de notificação ou personalização
-    5. Definição de prioridades e confirmação final
-    6. Outras funcionalidades ou opções relacionadas
-
-Aqui está o contexto acumulado sobre o que o tutorial deve abordar:
-{contexto_acumulado}
-
-Por favor, atualize ou crie o tutorial de forma clara e coesa, seguindo a mesma abordagem direta usada no exemplo do sistema GUIA da Exati. Desconsidere os urls presentes no documento.
+# Prompt template para descrição de imagens
+image_description_prompt = """
+Descreva esta imagem de forma objetiva e detalhada, considerando que ela faz parte de um tutorial de sistema.
+Considere o contexto do documento ao fazer a descrição.
 """
 
-# Definir o prompt template para geração de descrições de imagens
-image_description_prompt_template = """
-Você é um assistente de IA que descreve imagens em detalhes, considerando o contexto acumulado do tutorial. A imagem contém texto em português. Use o contexto fornecido para gerar uma descrição precisa e relevante.
+@dataclass
+class ImageDescription:
+    image_name: str
+    path: str
+    description: str
 
-Contexto Acumulado:
-{contexto_acumulado}
+@dataclass
+class DocumentResult:
+    document_id: str
+    descriptions: List[ImageDescription]
 
-Descrição da Imagem:
-"""
-
-# Função para remover URLs e informações redundantes
-def clean_text(text):
-    # Remove URLs
-    text = re.sub(r'http\S+', '', text)
-    # Remove espaços em branco excessivos
-    text = re.sub(r'\s+', ' ', text)
-    return text
-
-# Função para contar tokens usando tiktoken
-def count_tokens(text, encoding='gpt-4'):
-    enc = tiktoken.encoding_for_model(encoding)
-    return len(enc.encode(text))
-
-# Função para dividir texto em chunks de aproximadamente 2000 tokens
-def split_text_into_chunks(text, max_tokens=2000, encoding='gpt-4'):
-    enc = tiktoken.encoding_for_model(encoding)
-    tokens = enc.encode(text)
-    chunks = []
-    for i in range(0, len(tokens), max_tokens):
-        chunk = enc.decode(tokens[i:i + max_tokens])
-        chunks.append(chunk)
-    return chunks
-
-# Função para gerar ou atualizar o tutorial a partir do contexto acumulado usando Azure OpenAI
-def generate_or_update_tutorial(contexto_acumulado):
-    prompt = tutorial_prompt_template.format(contexto_acumulado=contexto_acumulado)
-    try:
-        response = client.chat.completions.create(
-            model=deployment_name,
-            messages=[
-                {"role": "system", "content": "Você é um assistente que ajuda a criar tutoriais detalhados."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"Erro ao chamar a API OpenAI para tutorial: {e}")
-        return ""
-
-# Função para extrair texto do PDF
-def extract_text_from_pdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    full_text = ""
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        text = page.get_text()
-        full_text += text + "\n"
-    doc.close()
-    cleaned_text = clean_text(full_text)
-    return cleaned_text
-
-# Função para extrair imagens do PDF e salvá-las em uma pasta
-def extract_images_from_pdf(pdf_path, images_folder, contexto_acumulado):
-    """
-    Extri imagens e suas posições do PDF
-    Retorna uma lista ordenada de dicionários com informações das imagens
-    """
-    if not os.path.exists(images_folder):
-        os.makedirs(images_folder)
+class DocumentProcessor:
+    def __init__(self):
+        self.base_dir = "output"
+        self.docs_dir = "docs"
+        os.makedirs(self.base_dir, exist_ok=True)
     
-    doc = fitz.open(pdf_path)
-    temp_image_info = []  # Lista temporária com todas as informações
-    
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
+    def process_images(self, pdf_path: str) -> List[ImageDescription]:
+        """
+        Extrai e processa imagens do PDF, gerando descrições
+        """
+        doc = fitz.open(pdf_path)
+        doc_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        image_descriptions = []
         
-        # Primeiro, mapear imagens da página
-        page_images = []
-        for img in page.get_images(full=True):
-            xref = img[0]
-            base_image = doc.extract_image(xref)
+        # Criar diretório para as imagens
+        image_dir = os.path.join(self.base_dir, doc_name, "images")
+        os.makedirs(image_dir, exist_ok=True)
+        
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            images = page.get_images(full=True)
             
-            if base_image:
-                page_images.append({
-                    "xref": xref,
-                    "image": base_image["image"],
-                    "ext": base_image["ext"]
-                })
+            for img_index, img in enumerate(images):
+                try:
+                    xref = img[0]
+                    base_image = doc.extract_image(xref)
+                    
+                    if not base_image:
+                        continue
+                    
+                    # Salvar imagem
+                    image_name = f"image_{page_num + 1}_{img_index + 1}.{base_image['ext']}"
+                    image_path = os.path.join(image_dir, image_name)
+                    
+                    with open(image_path, "wb") as img_file:
+                        img_file.write(base_image["image"])
+                    
+                    # Gerar descrição
+                    description = self.get_image_description(image_path)
+                    
+                    # Criar objeto ImageDescription
+                    image_desc = ImageDescription(
+                        image_name=image_name,
+                        path=image_path,
+                        description=description
+                    )
+                    
+                    image_descriptions.append(image_desc)
+                    
+                    logging.info(f"Processada imagem {image_name}")
+                    
+                except Exception as e:
+                    logging.error(f"Erro ao processar imagem: {e}")
+                    continue
         
-        # Processar cada imagem e obter sua posição
-        for img_index, image_data in enumerate(page_images):
-            try:
-                image_name = f"image_{page_num + 1}_{img_index + 1}.{image_data['ext']}"
-                image_path = os.path.join(images_folder, image_name)
-                
-                # Salvar a imagem
-                with open(image_path, "wb") as img_file:
-                    img_file.write(image_data["image"])
-                
-                # Obter posição da imagem
-                rect = None
-                for item in page.get_image_info():
-                    if "xref" in item and item["xref"] == image_data["xref"]:
-                        rect = fitz.Rect(item["bbox"])
-                        break
-                
-                # Gerar descrição
-                description = get_image_description(image_path, contexto_acumulado)
-                
-                # Armazenar todas as informações para ordenação
-                temp_image_info.append({
-                    "image_name": image_name,
-                    "description": description,
-                    "_page": page_num,
-                    "_rect": rect,
-                    "_path": image_path,
-                    "_y_pos": rect.y0 if rect else 0
-                })
-                
-                logging.info(f"Imagem {image_name} processada com sucesso na página {page_num + 1}")
-                
-            except Exception as e:
-                logging.error(f"Erro ao processar imagem na página {page_num + 1}: {e}")
-                continue
-
-    doc.close()
+        doc.close()
+        return image_descriptions
     
-    # Ordenar por página e posição vertical
-    temp_image_info.sort(key=lambda x: (x["_page"], x["_y_pos"]))
+    def get_image_description(self, image_path: str) -> str:
+        """
+        Gera descrição da imagem usando Azure OpenAI
+        """
+        try:
+            with open(image_path, "rb") as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            
+            response = client.chat.completions.create(
+                model=deployment_name,
+                messages=[
+                    {"role": "system", "content": "Você é um assistente especializado em descrever imagens."},
+                    {"role": "user", "content": image_description_prompt + f"\n![Imagem]({image_path})"}
+                ]
+            )
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            logging.error(f"Erro ao gerar descrição: {e}")
+            return "Erro na geração da descrição"
     
-    # Criar lista final apenas com as informações necessárias
-    final_image_info = [
-        {
-            "image_name": img["image_name"],
-            "description": img["description"]
+    def save_results(self, doc_result: DocumentResult):
+        """
+        Salva resultados em JSON e gera relatório HTML
+        """
+        doc_dir = os.path.join(self.base_dir, doc_result.document_id)
+        os.makedirs(doc_dir, exist_ok=True)
+        
+        # Salvar JSON
+        result_dict = {
+            "document_id": doc_result.document_id,
+            "descriptions": [
+                {
+                    "image_name": desc.image_name,
+                    "path": os.path.relpath(desc.path, doc_dir),
+                    "description": desc.description
+                }
+                for desc in doc_result.descriptions
+            ]
         }
-        for img in temp_image_info
-    ]
-    
-    return final_image_info
-
-# Função para gerar descrição de uma imagem usando Azure OpenAI com contexto acumulado
-def get_image_description(image_path, contexto_acumulado):
-    try:
-        with open(image_path, "rb") as image_file:
-            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-    except Exception as e:
-        logging.error(f"Erro ao ler a imagem {image_path}: {e}")
-        return "Descrição não disponível devido a erro na leitura da imagem."
-
-    prompt = image_description_prompt_template.format(
-        contexto_acumulado=contexto_acumulado
-    ) + f"![Imagem]({image_path})"
-
-    try:
-        response = client.chat.completions.create(
-            model=deployment_name,
-            messages=[
-                {"role": "system", "content": "Você é um assistente que descreve imagens com base em um contexto acumulado."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"Erro ao chamar a API para a imagem {image_path}: {e}")
-        return "Descrição não disponível devido a erro na chamada da API."
-
-def create_output_markdown(cleaned_text, image_descriptions, tutorial_text, output_md_path):
-    """
-    Cria um arquivo markdown com texto limpo, imagens e tutorial
-    """
-    try:
-        with open(output_md_path, "w", encoding="utf-8") as md_file:
-            # Título principal
-            md_file.write("# Documento Processado\n\n")
-            
-            # Seção 1: Texto Original com Imagens
-            md_file.write("## Conteúdo Original\n\n")
-            
-            # Dividir o texto em parágrafos e inserir imagens nas posições relativas
-            paragraphs = [p.strip() for p in cleaned_text.split('\n\n') if p.strip()]
-            
-            for paragraph in paragraphs:
-                md_file.write(f"{paragraph}\n\n")
-            
-            # Seção 2: Imagens e Suas Descrições
-            md_file.write("## Imagens do Documento\n\n")
-            
-            for img_desc in image_descriptions:
-                # Caminho relativo para a imagem
-                img_path = os.path.join("imagens_extraidas", img_desc["image_name"])
-                if os.path.exists(img_path):
-                    # Adicionar imagem
-                    md_file.write(f"![{img_desc['image_name']}]({img_path})\n\n")
-                    
-                    # Adicionar descrição
-                    md_file.write("**Descrição da Imagem:**\n")
-                    md_file.write(f"{img_desc['description']}\n\n")
-                    
-                    # Adicionar separador
-                    md_file.write("---\n\n")
-            
-            # Seção 3: Tutorial Gerado
-            md_file.write("## Tutorial Gerado\n\n")
-            md_file.write(f"{tutorial_text}\n\n")
-            
-        logging.info(f"Arquivo Markdown gerado com sucesso: {output_md_path}")
         
-    except Exception as e:
-        logging.error(f"Erro ao gerar arquivo Markdown: {e}")
+        json_path = os.path.join(doc_dir, "results.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(result_dict, f, ensure_ascii=False, indent=2)
+        
+        # Gerar relatório HTML
+        generate_html_report(doc_result)
 
-def main(pdf_path, tutorial_output_path, images_folder, dataset_path, output_md_path):
-    if not os.path.isfile(pdf_path):
-        logging.error(f"O arquivo PDF '{pdf_path}' não existe.")
-        return
+def generate_html_report(doc_result: DocumentResult):
+    """
+    Gera um relatório HTML com imagens e suas descrições
+    """
+    doc_dir = os.path.join("output", doc_result.document_id)
+    html_path = os.path.join(doc_dir, "report.html")
     
-    # Criar diretórios necessários
-    os.makedirs(os.path.dirname(output_md_path), exist_ok=True)
-    os.makedirs(images_folder, exist_ok=True)
+    html_template = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Relatório de Imagens - {doc_id}</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                margin: 20px;
+                background-color: #f5f5f5;
+            }}
+            .header {{
+                background-color: #333;
+                color: white;
+                padding: 20px;
+                margin-bottom: 20px;
+                border-radius: 5px;
+            }}
+            .image-container {{
+                background-color: white;
+                padding: 20px;
+                margin-bottom: 20px;
+                border-radius: 5px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            .image-row {{
+                display: flex;
+                margin-bottom: 20px;
+            }}
+            .image-col {{
+                flex: 1;
+                padding: 10px;
+            }}
+            .description-col {{
+                flex: 2;
+                padding: 10px;
+            }}
+            img {{
+                max-width: 100%;
+                height: auto;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+            }}
+            .description {{
+                background-color: #f9f9f9;
+                padding: 15px;
+                border-radius: 4px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>Relatório de Imagens - {doc_id}</h1>
+        </div>
+        
+        <div class="image-container">
+            {images_html}
+        </div>
+    </body>
+    </html>
+    """
     
-    logging.info("Extraindo texto do PDF...")
-    cleaned_text = extract_text_from_pdf(pdf_path)
+    # Gerar HTML para imagens e descrições
+    images_html = ""
+    for desc in doc_result.descriptions:
+        image_path = os.path.relpath(desc.path, doc_dir)
+        images_html += f"""
+        <div class="image-row">
+            <div class="image-col">
+                <img src="{image_path}" alt="{desc.image_name}">
+                <p><strong>{desc.image_name}</strong></p>
+            </div>
+            <div class="description-col">
+                <div class="description">
+                    <p>{desc.description}</p>
+                </div>
+            </div>
+        </div>
+        """
     
-    logging.info("Dividindo texto em chunks...")
-    chunks = split_text_into_chunks(cleaned_text)
-    logging.info(f"Total de chunks: {len(chunks)}")
+    # Gerar HTML final
+    html_content = html_template.format(
+        doc_id=doc_result.document_id,
+        images_html=images_html
+    )
     
-    # Processar chunks e gerar tutorial
-    contexto_acumulado = ""
-    tutorial_text = ""
+    # Salvar arquivo HTML
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
     
-    for idx, chunk in enumerate(chunks):
-        logging.info(f"Processando chunk {idx + 1}/{len(chunks)}...")
-        contexto_acumulado += "\n" + chunk
-        tutorial = generate_or_update_tutorial(contexto_acumulado)
-        if tutorial:
-            tutorial_text = tutorial
+    logging.info(f"Relatório HTML gerado: {html_path}")
+
+def main():
+    processor = DocumentProcessor()
     
-    # Extrair imagens e gerar descrições
-    logging.info("Extraindo imagens e gerando descrições...")
-    image_descriptions = extract_images_from_pdf(pdf_path, images_folder, contexto_acumulado)
+    # Processar todos os PDFs na pasta docs
+    for pdf_file in os.listdir(processor.docs_dir):
+        if not pdf_file.endswith('.pdf'):
+            continue
+        
+        pdf_path = os.path.join(processor.docs_dir, pdf_file)
+        doc_name = os.path.splitext(pdf_file)[0]
+        
+        logging.info(f"Processando documento: {pdf_file}")
+        
+        # Processar imagens e gerar descrições
+        descriptions = processor.process_images(pdf_path)
+        
+        # Se não houver imagens, pular para o próximo documento
+        if not descriptions:
+            logging.info(f"Nenhuma imagem encontrada em: {pdf_file}")
+            continue
+        
+        # Criar resultado do documento
+        doc_result = DocumentResult(
+            document_id=doc_name,
+            descriptions=descriptions
+        )
+        
+        # Salvar resultados
+        processor.save_results(doc_result)
+        
+        logging.info(f"Processamento concluído para: {doc_name}")
     
-    # Salvar descrições em CSV
-    with open(dataset_path, "w", newline='', encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=["image_name", "description"])
-        writer.writeheader()
-        for item in image_descriptions:
-            writer.writerow(item)
-    
-    # Criar arquivo Markdown final
-    logging.info("Gerando arquivo Markdown final...")
-    create_output_markdown(cleaned_text, image_descriptions, tutorial_text, output_md_path)
+    logging.info("\nProcessamento concluído!")
 
 if __name__ == "__main__":
-    pdf_path = "documento.pdf"
-    tutorial_output_path = "output/tutorial.md"
-    images_folder = "imagens_extraidas"
-    dataset_path = "output/descricao_imagens.csv"
-    output_md_path = "output/documento_final.md"
-    
-    main(pdf_path, tutorial_output_path, images_folder, dataset_path, output_md_path)
-a
+    main()
